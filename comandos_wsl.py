@@ -1,5 +1,6 @@
 import subprocess
 import os
+import shutil
 
 def run_metaphlan_analysis(input_file):
     # Para obtener el nombre del folder y del archivo
@@ -10,6 +11,17 @@ def run_metaphlan_analysis(input_file):
     input_folder = f"/mnt/c/Users/david/OneDrive/Escritorio/Proyectos/Microbioma-Proyecto/data/{folder_name}"
     input_file_path = f"{input_folder}/{file_name}"
     
+    # Asegurarse de que el archivo de entrada existe en la ubicación esperada
+    windows_input_file = os.path.normpath(f"C:\\Users\\david\\OneDrive\\Escritorio\\Proyectos\\Microbioma-Proyecto\\data\\{folder_name}\\{file_name}")
+    if not os.path.exists(windows_input_file):
+        # Si el archivo no está en la carpeta data, moverlo desde uploads
+        uploads_file = os.path.normpath(f"C:\\Users\\david\\OneDrive\\Escritorio\\Proyectos\\Microbioma-Proyecto\\uploads\\{file_name}")
+        if os.path.exists(uploads_file):
+            os.makedirs(os.path.dirname(windows_input_file), exist_ok=True)
+            shutil.move(uploads_file, windows_input_file)
+        else:
+            return None, f"Input file not found: {windows_input_file}"
+
     # Determinar el tipo de archivo de entrada
     if input_file.endswith('.bz2'):
         input_type = "bowtie2out"

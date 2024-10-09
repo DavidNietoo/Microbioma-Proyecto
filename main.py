@@ -5,17 +5,14 @@ import dash_bootstrap_components as dbc
 import plotly.express as px
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-import base64
-import datetime
 import os
 import io
 import dash_uploader as du
 from comandos_wsl import run_metaphlan_analysis
-import time
 import plotly.colors as pc
 import json
 import plotly.graph_objs as go
-import sys
+import logging
 
 external_stylesheets = ['https://codepen.io/chriddyp/pen/bWLwgP.css']
 
@@ -23,6 +20,8 @@ app = Dash(__name__, external_stylesheets=external_stylesheets, suppress_callbac
 
 # Configuracion del Dash Uploader
 du.configure_upload(app, "uploads", use_upload_id=True)
+
+app.uploaded_files = []
 
 # Creacion del layout de la pagina de subida de archivos
 upload_layout = dbc.Container([
@@ -102,7 +101,6 @@ analysis_layout = dbc.Container([
                                {'label': 'Bar Chart', 'value': 'bar'},
                                {'label': 'Heatmap', 'value': 'heatmap'},
                                {'label': 'Sankey Diagram', 'value': 'sankey'},
-                               {'label': 'Stacked Bar Chart', 'value': 'stacked_bar'},
                                {'label': 'Sunburst Chart', 'value': 'sunburst'}
                            ],
                            value='bar'  # seleccion default
@@ -130,6 +128,15 @@ analysis_layout = dbc.Container([
                                value='Set1'  # seleccion default
                            ),
                        ]),
+                       html.Div(id="sample-comparison-container", style={'display': 'none'}, children=[
+                            html.P("Select samples to compare:"),
+                            dcc.Dropdown(
+                                id="sample-comparison-dropdown",
+                                options=[],
+                                multi=True,
+                                placeholder="Select samples to compare"
+                            ),
+                        ]),
                        dbc.Row([
                            dbc.Col([
                                html.P("Minimum relative abundance"),
@@ -139,7 +146,7 @@ analysis_layout = dbc.Container([
                                    placeholder="Minimum",
                                    min=0,
                                    max=100,
-                                   step=0.1,
+                                   step=0.01,
                                    value=0
                                ),
                            ], width=4),
@@ -168,7 +175,7 @@ analysis_layout = dbc.Container([
                    ]),
                ]),
                dcc.Graph(id="bar-chart"),
-               dcc.Graph(id="overlapped-chart")
+               dcc.Graph(id="stacked-bar-chart")
            ])
        ]),
        dcc.Tab(label='Data Table', children=[
@@ -223,7 +230,7 @@ analysis_layout = dbc.Container([
             html.Div([
                 html.H5("Files to download"),
                 html.Div(id='download-buttons'),
-                html.Button("Combined Data Table", id="download-combined-table-button")
+                dcc.Download(id="download")
             ])
         ])
    ])
@@ -235,7 +242,11 @@ app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
     html.Div(id='page-content'),
     html.Div(id='analysis-progress', style={'display': 'none'}),
+    html.Div(id='uploaded-files-monitor')
 ])
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
 # Callback para actualizar el contenido de la pagina basado en la URL
 @app.callback(Output('page-content', 'children'),
@@ -288,7 +299,6 @@ def parse_metaphlan_output(file_path):
     df['Species'] = df['#clade_name'].str.split('|').str[6].str.replace('s__', '')
     return df
 
-# Modify the callback for uploading files
 @app.callback(
     [Output('upload-status', 'children'),
      Output('uploaded-files-list', 'children')],
@@ -297,8 +307,9 @@ def parse_metaphlan_output(file_path):
      State('dash-uploader', 'upload_id')]
 )
 def update_upload_status(is_completed, filenames, upload_id):
+    logging.info(f"update_upload_status called. is_completed: {is_completed}, filenames: {filenames}")
+    
     if is_completed and filenames is not None:
-        uploaded_files = []
         for filename in filenames:
             original_file_path = os.path.join('uploads', upload_id, filename)
             folder_name = os.path.splitext(filename)[0]
@@ -306,42 +317,49 @@ def update_upload_status(is_completed, filenames, upload_id):
             os.makedirs(new_folder_path, exist_ok=True)
             new_file_path = os.path.join(new_folder_path, filename)
             os.rename(original_file_path, new_file_path)
-            uploaded_files.append(new_file_path)
+            if new_file_path not in app.uploaded_files:
+                app.uploaded_files.append(new_file_path)
+                logging.info(f"Added new file to app.uploaded_files: {new_file_path}")
+            else:
+                logging.info(f"File already in app.uploaded_files: {new_file_path}")
+        
+        logging.info(f"Current app.uploaded_files: {app.uploaded_files}")
         
         status = f"Files uploaded successfully: {', '.join(filenames)}. Click 'Start Analysis' to begin processing."
-        file_list = html.Ul([html.Li(filename) for filename in filenames])
+        file_list = html.Ul([html.Li(os.path.basename(file)) for file in app.uploaded_files])
         return status, file_list
-    return "No files uploaded yet.", None
+    elif not app.uploaded_files:
+        logging.info("No files in app.uploaded_files, raising PreventUpdate")
+        raise PreventUpdate
+    else:
+        logging.info(f"No new files uploaded. Current app.uploaded_files: {app.uploaded_files}")
+        file_list = html.Ul([html.Li(os.path.basename(file)) for file in app.uploaded_files])
+        return "No new files uploaded.", file_list
 
-# Modificacion del callback para el boton de inicio de analisis
 @app.callback(
     [Output('analysis-status', 'children'),
      Output('analysis-complete', 'data'),
      Output('loading-output', 'children'),
      Output('url', 'pathname')],
     [Input('start-analysis-button', 'n_clicks')],
-    [State('dash-uploader', 'fileNames'),
-     State('dash-uploader', 'upload_id')],
     prevent_initial_call=True
 )
-def start_analysis(n_clicks, filenames, upload_id):
-    if n_clicks > 0 and filenames is not None:
-        uploaded_files = [os.path.join('data', os.path.splitext(filename)[0], filename) for filename in filenames]
-        
+def start_analysis(n_clicks):
+    if n_clicks > 0 and app.uploaded_files:
         analysis_results = []
         analysis_errors = []
-        for file_path in uploaded_files:
+        for file_path in app.uploaded_files:
             output_file, error_message = run_metaphlan_analysis(file_path)
             if output_file:
                 analysis_results.append(output_file)
             else:
                 analysis_errors.append(f"Error analyzing {os.path.basename(file_path)}: {error_message}")
         
-        if len(analysis_results) == len(uploaded_files):
-            analysis_status = f"Analysis completed for all {len(uploaded_files)} files. Results saved."
+        if len(analysis_results) == len(app.uploaded_files):
+            analysis_status = f"Analysis completed for all {len(app.uploaded_files)} files. Results saved."
             return analysis_status, {'complete': True, 'results': analysis_results}, '', '/analysis'
         elif len(analysis_results) > 0:
-            analysis_status = f"Analysis completed for {len(analysis_results)} out of {len(uploaded_files)} files. {len(analysis_errors)} file(s) failed: {'; '.join(analysis_errors)}"
+            analysis_status = f"Analysis completed for {len(analysis_results)} out of {len(app.uploaded_files)} files. {len(analysis_errors)} file(s) failed: {'; '.join(analysis_errors)}"
             return analysis_status, {'complete': False}, '', '/'
         else:
             analysis_status = f"Analysis failed for all files: {'; '.join(analysis_errors)}"
@@ -355,11 +373,13 @@ def start_analysis(n_clicks, filenames, upload_id):
      Output('data-dropdown', 'value'),
      Output('table-sample-dropdown', 'options'),
      Output('table-sample-dropdown', 'value'),
-     Output('exclude-taxa-dropdown', 'options')],
+     Output('exclude-taxa-dropdown', 'options'),
+     Output('sample-comparison-dropdown', 'options')],
     [Input('analysis-complete', 'data'),
-     Input('taxo-dropdown', 'value')]
+     Input('taxo-dropdown', 'value')],
+    [State('data-dropdown', 'value')]
 )
-def update_dropdown_options(analysis_data, selected_taxo):
+def update_dropdown_options(analysis_data, selected_taxo, current_sample):
     if not analysis_data or not analysis_data.get('complete'):
         raise PreventUpdate
     
@@ -367,7 +387,7 @@ def update_dropdown_options(analysis_data, selected_taxo):
     sample_names = [os.path.basename(os.path.dirname(result)) for result in results]
     
     options = [{'label': name, 'value': i} for i, name in enumerate(sample_names)]
-    options.append({'label': 'Combined', 'value': 'combined'})
+    options.append({'label': 'All', 'value': 'all-samples'})
     
     # Obtener los taxa unicos para el nivel taxonomico seleccionado
     dfs = [parse_metaphlan_output(result) for result in results]
@@ -375,13 +395,20 @@ def update_dropdown_options(analysis_data, selected_taxo):
     unique_taxa = combined_df[selected_taxo].dropna().unique()
     exclude_options = [{'label': taxon, 'value': taxon} for taxon in unique_taxa if taxon]
     
-    return options, 0, options, 0, exclude_options
+    # Opciones para el dropdown de comparacion de muestras
+    comparison_options = [{'label': name, 'value': i} for i, name in enumerate(sample_names)]
+    
+    # Mantener la seleccion de muestra actual
+    if current_sample is None:
+        current_sample = 0
+    
+    return options, current_sample, options, current_sample, exclude_options, comparison_options
 
 # Callback para actualizar los graficos
 @app.callback(
     [Output("bar-chart", "figure"),
-     Output("overlapped-chart", "figure"),
-     Output("overlapped-chart", "style")],
+     Output("stacked-bar-chart", "figure"),
+     Output("stacked-bar-chart", "style")],
     [Input("taxo-dropdown", "value"),
      Input("data-dropdown", "value"),
      Input("graph-type-dropdown", "value"),
@@ -389,11 +416,12 @@ def update_dropdown_options(analysis_data, selected_taxo):
      Input("discrete-color-dropdown", "value"),
      Input("min-abundance-input", "value"),
      Input("max-abundance-input", "value"),
-     Input("exclude-taxa-dropdown", "value")],
+     Input("exclude-taxa-dropdown", "value"),
+     Input("sample-comparison-dropdown", "value")],
     [State('analysis-complete', 'data')]
 )
 def update_graph(selected_taxo, selected_data, graph_type, color_palette, discrete_color_palette, 
-                 min_abundance, max_abundance, excluded_taxa, analysis_data):
+                 min_abundance, max_abundance, excluded_taxa, comparison_samples, analysis_data):
     if not analysis_data or not analysis_data.get('complete'):
         raise PreventUpdate
 
@@ -401,26 +429,24 @@ def update_graph(selected_taxo, selected_data, graph_type, color_palette, discre
         results = analysis_data['results']
         dfs = [parse_metaphlan_output(result) for result in results]
         
-        if selected_data == 'combined':
-            df = pd.concat(dfs)
-        else:
+        if selected_data == 'all-samples':
+            if comparison_samples:
+                df = pd.concat([dfs[i] for i in comparison_samples])
+            else:
+                df = pd.concat(dfs)
+        elif selected_data is not None:
             df = dfs[int(selected_data)]
+        else:
+            df = dfs[0]  # Default a la primera muestra si no se selecciona ninguna
         
-        # Asegura de que relative_abundance se trate como un porcentaje
+        # Aplicar filtros y normalizacion de datos
         df['relative_abundance'] = df['relative_abundance'].astype(float)
-        
-        # Normaliza relative abundance para asegurar que suma 100%
         total_abundance = df['relative_abundance'].sum()
         df['relative_abundance'] = (df['relative_abundance'] / total_abundance) * 100
-        
-        # Filtrar el dataframe basado en min y max abundance
         df = df[(df['relative_abundance'] >= min_abundance) & (df['relative_abundance'] <= max_abundance)]
-        
-        # Excluye los taxa seleccionados
         if excluded_taxa:
             df = df[~df[selected_taxo].isin(excluded_taxa)]
         
-        # Verificar si el dataframe esta vacio despues de filtrar
         if df.empty:
             return go.Figure(), go.Figure(), {'display': 'none'}
         
@@ -430,24 +456,60 @@ def update_graph(selected_taxo, selected_data, graph_type, color_palette, discre
         color_sequence = pc.sample_colorscale(color_palette, 10)
         
         if graph_type == 'bar':
-            if selected_data == 'combined':
-                color_sequence = getattr(px.colors.qualitative, discrete_color_palette)
+            if selected_data == 'all-samples':
+                sample_names = [dfs[i]['Sample'].iloc[0] for i in (comparison_samples or range(len(dfs)))]
+                taxo_data = df.groupby([selected_taxo, 'Sample'])['relative_abundance'].sum().reset_index()
+                taxo_data = taxo_data.pivot(index=selected_taxo, columns='Sample', values='relative_abundance').reset_index()
+                taxo_data = taxo_data.sort_values(by=sample_names[0], ascending=False)
                 
-                if len(dfs) > 8:
-                    fig = make_subplots(rows=1, cols=1, subplot_titles=['Combined Samples'], shared_yaxes=True)
-                    combined_df = pd.concat(dfs)
-                    combined_df['relative_abundance'] = (combined_df['relative_abundance'] / combined_df['relative_abundance'].sum()) * 100
-                    combined_df = combined_df.groupby(selected_taxo)['relative_abundance'].sum().reset_index().sort_values(by='relative_abundance', ascending=True)
-                    fig.add_trace(go.Bar(x=combined_df[selected_taxo], y=combined_df['relative_abundance'], orientation='v', marker_color=color_sequence[0]), row=1, col=1)
+                if len(taxo_data) > 8:
+                    fig = go.Figure()
+                    for i, sample in enumerate(sample_names):
+                        fig.add_trace(go.Bar(
+                            y=taxo_data[selected_taxo],
+                            x=taxo_data[sample],
+                            name=sample,
+                            orientation='h',
+                            marker_color=px.colors.qualitative.Set1[i % len(px.colors.qualitative.Set1)]
+                        ))
+                    fig.update_layout(barmode='group', xaxis_title='Relative Abundance (%)', yaxis_title=selected_taxo)
                 else:
-                    fig = make_subplots(rows=len(dfs), cols=1, subplot_titles=[df['Sample'].iloc[0] for df in dfs], shared_xaxes=True)
-                    for i, sample_df in enumerate(dfs):
-                        sample_df['relative_abundance'] = (sample_df['relative_abundance'] / sample_df['relative_abundance'].sum()) * 100
-                        sample_df = sample_df.groupby(selected_taxo)['relative_abundance'].sum().reset_index().sort_values(by='relative_abundance', ascending=True)
-                        fig.add_trace(go.Bar(x=sample_df[selected_taxo], y=sample_df['relative_abundance'], orientation='v', name=sample_df['Sample'].iloc[0], marker_color=color_sequence[i % len(color_sequence)]), row=i+1, col=1)
+                    fig = go.Figure()
+                    for i, sample in enumerate(sample_names):
+                        fig.add_trace(go.Bar(
+                            x=taxo_data[selected_taxo],
+                            y=taxo_data[sample],
+                            name=sample,
+                            marker_color=px.colors.qualitative.Set1[i % len(px.colors.qualitative.Set1)]
+                        ))
+                    fig.update_layout(barmode='group', xaxis_title=selected_taxo, yaxis_title='Relative Abundance (%)')
                 
-                fig.update_layout(height=600, width=1000, title=f'Relative Abundance of {selected_taxo}', yaxis_title='Relative Abundance (%)')
-                fig.update_yaxes(range=[0, 100])  # pone los axis en un rango de 0 a 100
+                fig.update_layout(
+                    title=f'Comparison of {selected_taxo} Relative Abundance across Samples',
+                    height=600,
+                    width=1000
+                )
+
+                # Crear grafico stacked bar chart
+                stacked_df = df.groupby([selected_taxo, 'Sample'])['relative_abundance'].sum().reset_index()
+                stacked_df = stacked_df.sort_values('relative_abundance', ascending=False)
+                
+                # Limite de 15 taxas para mejor legibilidad
+                top_taxa = stacked_df.groupby(selected_taxo)['relative_abundance'].sum().nlargest(15).index
+                stacked_df = stacked_df[stacked_df[selected_taxo].isin(top_taxa)]
+                
+                stacked_fig = px.bar(stacked_df, 
+                                     x='relative_abundance', 
+                                     y=selected_taxo, 
+                                     color='Sample', 
+                                     orientation='h',
+                                     barmode='stack',
+                                     labels={'relative_abundance': 'Relative Abundance (%)'},
+                                     title=f'Stacked Relative Abundance of Top 15 {selected_taxo} Across Samples')
+                
+                stacked_fig.update_layout(height=600, width=1000, yaxis={'categoryorder':'total ascending'})
+                
+                return fig, stacked_fig, {'display': 'block'}
             else:
                 taxo_data = df.groupby(selected_taxo)['relative_abundance'].sum().reset_index().sort_values(by='relative_abundance', ascending=False)
                 if len(taxo_data) > 8:
@@ -456,9 +518,8 @@ def update_graph(selected_taxo, selected_data, graph_type, color_palette, discre
                 else:
                     fig = px.bar(taxo_data, x=selected_taxo, y='relative_abundance', color=selected_taxo, color_discrete_sequence=color_sequence)
                     fig.update_yaxes(range=[0, 100])
-                fig.update_layout(title=f'Relative Abundance of {selected_taxo} in {df["Sample"].iloc[0]} Sample', height=600, width=1000)
-            
-            return fig, go.Figure(), {'display': 'none'}
+                fig.update_layout(title=f'Relative Abundance of {selected_taxo} in {"All" if selected_data == "all-samples" else df["Sample"].iloc[0]} Sample', height=600, width=1000)
+                return fig, go.Figure(), {'display': 'none'}
         elif graph_type == 'heatmap':
             heatmap_data = df.pivot_table(index=selected_taxo, columns='Sample', values='relative_abundance', aggfunc='sum').fillna(0)
             
@@ -510,18 +571,16 @@ def update_graph(selected_taxo, selected_data, graph_type, color_palette, discre
         elif graph_type == 'sankey':
             fig = create_sankey_diagram(df, selected_taxo, selected_data)
             return fig, go.Figure(), {'display': 'none'}
-        elif graph_type == 'stacked_bar':
-            fig = create_stacked_bar_chart(df, selected_taxo, selected_data, color_palette)
-            return fig, go.Figure(), {'display': 'none'}
         elif graph_type == 'sunburst':
             fig = create_sunburst_chart(df, selected_taxo)
             return fig, go.Figure(), {'display': 'none'}
         else:
             return go.Figure(), go.Figure(), {'display': 'none'}
     except Exception as e:
+        print(f"Error in update_graph: {e}")
         return go.Figure(), go.Figure(), {'display': 'none'}
 
-# Funciones para crear los diagramas de Sankey, stacked_bar_chart y sunburst_chart
+# Funciones para crear los diagramas de Sankey y sunburst_chart
 def create_sankey_diagram(df, selected_taxo, selected_data):
     # Define los niveles taxonomicos en orden
     tax_levels = ['Kingdom', 'Phylum', 'Class', 'Order', 'Family', 'Genus', 'Species']
@@ -625,49 +684,6 @@ def create_sunburst_chart(df, selected_taxo):
         print(f"Error in create_sunburst_chart: {e}")
         return go.Figure()  # Muestra un grafico vacio en caso de error
 
-def create_stacked_bar_chart(df, selected_taxo, selected_data, color_palette):
-    # Agrupa los datos por el nivel taxonomico seleccionado y la muestra
-    grouped_data = df.groupby([selected_taxo, 'Sample'])['relative_abundance'].sum().reset_index()
-    
-    # Pivotea los datos para crear una columna para cada grupo taxonomico
-    pivot_data = grouped_data.pivot(index='Sample', columns=selected_taxo, values='relative_abundance').fillna(0)
-    
-    # Ordena las columnas por la suma de relative abundance en todas las muestras
-    column_order = pivot_data.sum().sort_values(ascending=False).index
-    pivot_data = pivot_data[column_order]
-    
-    # Creacion del grafico de stacked bar chart
-    fig = go.Figure()
-    
-    for taxon in pivot_data.columns:
-        fig.add_trace(go.Bar(
-            x=pivot_data.index,
-            y=pivot_data[taxon],
-            name=taxon,
-            hoverinfo='name+y',
-            textposition='auto'
-        ))
-    
-    # Update del layout
-    fig.update_layout(
-        title=f'Stacked Bar Chart of {selected_taxo} Relative Abundance',
-        xaxis_title='Sample',
-        yaxis_title='Relative Abundance (%)',
-        barmode='stack',
-        legend_title=selected_taxo,
-        colorway=px.colors.sequential.get(color_palette, px.colors.qualitative.Plotly),
-        yaxis_range=[0, 100]
-    )
-    
-    # si hay solo una muestra, ajusta el layout
-    if len(pivot_data.index) == 1:
-        fig.update_layout(
-            xaxis={'type': 'category'},
-            xaxis_title='',
-        )
-    
-    return fig
-
 # Callback para la tabla de datos
 @app.callback(
     [Output('data-table', 'data'),
@@ -683,7 +699,7 @@ def update_table(selected_sample, search_value, analysis_data):
     results = analysis_data['results']
     dfs = [parse_metaphlan_output(result) for result in results]
     
-    if selected_sample == 'combined':
+    if selected_sample == 'all-samples':
         df = pd.concat(dfs)
     else:
         df = dfs[int(selected_sample)]
@@ -706,7 +722,18 @@ def update_download_buttons(analysis_data):
         return []
     
     results = analysis_data['results']
-    return [html.Button(f"Download {os.path.basename(result)}", id={'type': 'download-button', 'index': i}) for i, result in enumerate(results)]
+    buttons = []
+    
+    for i, result in enumerate(results):
+        sample_name = os.path.basename(os.path.dirname(result))
+        buttons.extend([
+            html.Button(f"Download {sample_name}.bz2", id={'type': 'download-button', 'index': f'{i}-bz2'}),
+            html.Button(f"Download {sample_name}.csv", id={'type': 'download-button', 'index': f'{i}-csv'})
+        ])
+    
+    buttons.append(html.Button("Download Combined Data Table", id="download-combined-table-button"))
+    
+    return buttons
 
 @app.callback(
     Output("download", "data"),
@@ -728,16 +755,26 @@ def download_files(n_clicks, n_clicks_combined, analysis_data):
         results = analysis_data['results']
         dfs = [parse_metaphlan_output(result) for result in results]
         combined_df = pd.concat(dfs)
-        return dcc.send_data_frame(combined_df.to_csv, "combined_data_table.csv")
+        return dcc.send_data_frame(combined_df.to_csv, "combined_data_table.csv", index=False)
     
-    file_index = json.loads(button_id)['index']
-    file_path = analysis_data['results'][file_index]
-    file_path = convert_path(file_path)
+    file_index, file_type = json.loads(button_id)['index'].split('-')
+    file_index = int(file_index)
     
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"The file {file_path} does not exist.")
-    
-    return dcc.send_file(file_path)
+    if file_type == 'bz2':
+        # encuentra el archivo original .bz2
+        sample_folder = os.path.dirname(analysis_data['results'][file_index])
+        bz2_files = [f for f in os.listdir(sample_folder) if f.endswith('.bz2')]
+        if not bz2_files:
+            raise PreventUpdate
+        bz2_file_path = os.path.join(sample_folder, bz2_files[0])
+        return dcc.send_file(bz2_file_path)
+    elif file_type == 'csv':
+        # genera un archivo csv con los resultados
+        df = parse_metaphlan_output(analysis_data['results'][file_index])
+        sample_name = os.path.basename(os.path.dirname(analysis_data['results'][file_index]))
+        return dcc.send_data_frame(df.to_csv, f"{sample_name}_results.csv", index=False)
+
+    raise PreventUpdate
 
 @app.callback(
     Output('exclude-taxa-dropdown', 'value'),
@@ -745,6 +782,25 @@ def download_files(n_clicks, n_clicks_combined, analysis_data):
 )
 def clear_excluded_taxa(selected_taxo):
     return []
+
+@app.callback(
+    Output('uploaded-files-monitor', 'children'),
+    Input('interval-component', 'n_intervals')
+)
+def monitor_uploaded_files(n):
+    return f"Current uploaded files: {app.uploaded_files}"
+
+# componente de intervalo para actualizar la pagina cada 1000 ms
+dcc.Interval(id='interval-component', interval=1000, n_intervals=0)
+
+@app.callback(
+    Output('sample-comparison-container', 'style'),
+    [Input('data-dropdown', 'value')]
+)
+def toggle_sample_comparison(selected_data):
+    if selected_data == 'all-samples':
+        return {'display': 'block'}
+    return {'display': 'none'}
 
 if __name__ == '__main__':
     app.run_server(debug=True)
